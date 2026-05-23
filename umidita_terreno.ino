@@ -138,10 +138,28 @@ uint32_t fineVisualizzazioneManualeUnix = 0;
 volatile bool richiestaVisualizzazioneDaPulsante = false;
 unsigned long ultimoPulsanteAccettatoMs = 0;
 
+byte ultimoMinutoProssimaMostrato = 255;
+byte ultimaOraProssimaMostrata = 255;
+byte ultimoGiornoProssimaMostrato = 0;
+// ===============================
+// PULSANTE LETTURA MANUALE
+// ===============================
+
+const byte PIN_PULSANTE_LETTURA_MANUALE = 3;
+
+const uint32_t DURATA_DISPLAY_LETTURA_MANUALE_SEC = 5UL * 60UL;  // 5 minuti
+const unsigned long DEBOUNCE_LETTURA_MANUALE_MS = 300;
+
+volatile bool richiestaLetturaManuale = false;
+
+unsigned long ultimoClickLetturaManualeMs = 0;
+
+bool schermataLetturaManualeAttiva = false;
+uint32_t fineSchermataLetturaManualeUnix = 0;
+
 byte ultimoMinutoManualeMostrato = 255;
 byte ultimaOraManualeMostrata = 255;
 byte ultimoGiornoManualeMostrato = 0;
-
 
 // ===============================
 // PARAMETRI LETTURA SENSORI
@@ -255,7 +273,10 @@ void stampaDueCifreSerial(int valore);
 bool esisteSensoreSottoSoglia();
 uint16_t prossimoMinutoLettura(DateTime adesso);
 
-
+void isrPulsanteLetturaManuale();
+void gestisciPulsanteLetturaManuale(DateTime adesso);
+void gestisciSchermataLetturaManuale(DateTime adesso);
+void mostraLetturaManualeLCD(DateTime adesso);
 // ===============================
 // SETUP
 // ===============================
@@ -275,6 +296,13 @@ void setup() {
   attachInterrupt(
     digitalPinToInterrupt(PIN_PULSANTE_PROSSIMA_ESECUZIONE),
     isrPulsanteProssimaEsecuzione,
+    FALLING
+  );
+
+  pinMode(PIN_PULSANTE_LETTURA_MANUALE, INPUT_PULLUP);
+  attachInterrupt(
+    digitalPinToInterrupt(PIN_PULSANTE_LETTURA_MANUALE),
+    isrPulsanteLetturaManuale,
     FALLING
   );
 
@@ -364,31 +392,23 @@ void setup() {
 void loop() {
   DateTime adesso = rtc.now();
 
-  // Se e' cambiata la data, ricalcola alba/tramonto del nuovo giorno.
-  // Non serve centrare esattamente la mezzanotte:
-  // basta accorgersi che giorno/mese/anno sono cambiati.
+  // 1. Aggiorna alba/tramonto se è cambiato giorno.
   aggiornaOrariSeCambiaGiorno(adesso);
 
-  // Il pulsante funziona anche quando il display e' spento.
-  // La schermata manuale ha priorita' grafica, ma non blocca letture o monitoraggio.
+  // 2. Gestisce i due pulsanti.
+  //    Queste funzioni devono solo attivare schermate o letture manuali,
+  //    ma non devono impedire le letture automatiche.
+  gestisciPulsanteLetturaManuale(adesso);
   gestisciPulsanteProssimaEsecuzione(adesso);
 
-  if (visualizzazioneManualeAttiva) {
-    gestisciVisualizzazioneManuale(adesso);
-  }
-
-  // Durante il monitoraggio post-lettura il display resta sulla schermata umidita'.
-  // In questa modalita' i sensori vengono riletti ogni 30 minuti.
-  if (monitoraggioAttivo) {
-    gestisciMonitoraggio(adesso);
-    delay(PAUSA_LOOP_MS);
-    return;
-  }
-
-  // Se scatta una lettura programmata, accendi comunque il display,
-  // leggi i sensori e avvia il monitoraggio.
+  // 3. PRIORITÀ MASSIMA:
+  //    se è l'ora di una lettura programmata, la facciamo comunque,
+  //    anche se era attiva una schermata manuale.
   if (deveFareLettura(adesso)) {
+    visualizzazioneManualeAttiva = false;
+    schermataLetturaManualeAttiva = false;
     postSpegnimentoAttivo = false;
+
     accendiDisplay();
 
     leggiTuttiISensori();
@@ -399,21 +419,59 @@ void loop() {
     return;
   }
 
-  // Finito il monitoraggio, il display resta acceso altri 5 minuti
-  // mostrando il conto alla rovescia di spegnimento.
+  // 4. Se siamo nelle 2 ore dopo una lettura automatica,
+  //    continua a gestire le riletture reali ogni 30 minuti.
+  //    Questa parte deve girare anche se sopra al display c'è una schermata manuale.
+  if (monitoraggioAttivo) {
+    gestisciMonitoraggio(adesso);
+
+    // Se è attiva la schermata della lettura manuale, ha priorità grafica.
+    if (schermataLetturaManualeAttiva) {
+      gestisciSchermataLetturaManuale(adesso);
+    }
+    // Altrimenti, se è attiva la schermata "prossima esecuzione", mostra quella.
+    else if (visualizzazioneManualeAttiva) {
+      gestisciVisualizzazioneManuale(adesso);
+    }
+
+    delay(PAUSA_LOOP_MS);
+    return;
+  }
+
+  // 5. Fuori dal monitoraggio, la schermata lettura manuale sensori
+  //    resta visibile per 5 minuti.
+  if (schermataLetturaManualeAttiva) {
+    gestisciSchermataLetturaManuale(adesso);
+    delay(PAUSA_LOOP_MS);
+    return;
+  }
+
+  // 6. Schermata "prossima esecuzione" da pulsante.
+  if (visualizzazioneManualeAttiva) {
+    gestisciVisualizzazioneManuale(adesso);
+    delay(PAUSA_LOOP_MS);
+    return;
+  }
+
+  // 7. Finito il monitoraggio, display acceso ancora 5 minuti
+  //    con messaggio di spegnimento.
   if (postSpegnimentoAttivo) {
     gestisciPostSpegnimento(adesso);
     delay(PAUSA_LOOP_MS);
     return;
   }
 
-  // Fuori da lettura/monitoraggio/post, il display resta spento
-  // fino a 15 minuti prima della prossima lettura.
+  // 8. Stato normale:
+  //    display spento, oppure pre-accensione 15 minuti prima della lettura.
   gestisciDisplayInAttesa(adesso);
 
   delay(PAUSA_LOOP_MS);
 }
 
+
+void isrPulsanteLetturaManuale() {
+  richiestaLetturaManuale = true;
+}
 
 // ===============================
 // SCHERMATA DI ATTESA
@@ -478,6 +536,124 @@ bool deveFareLettura(DateTime adesso) {
   return true;
 }
 
+void gestisciPulsanteLetturaManuale(DateTime adesso) {
+  bool pulsantePremuto = false;
+
+  noInterrupts();
+  if (richiestaLetturaManuale) {
+    richiestaLetturaManuale = false;
+    pulsantePremuto = true;
+  }
+  interrupts();
+
+  if (digitalRead(PIN_PULSANTE_LETTURA_MANUALE) == LOW) {
+    pulsantePremuto = true;
+  }
+
+  if (!pulsantePremuto) {
+    return;
+  }
+
+  unsigned long oraMs = millis();
+
+  if (oraMs - ultimoClickLetturaManualeMs < DEBOUNCE_LETTURA_MANUALE_MS) {
+    return;
+  }
+
+  ultimoClickLetturaManualeMs = oraMs;
+
+  visualizzazioneManualeAttiva = false;
+
+  accendiDisplay();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Lettura manuale");
+  lcd.setCursor(0, 1);
+  lcd.print("Attendere...");
+
+  leggiTuttiISensori();
+
+  schermataLetturaManualeAttiva = true;
+  fineSchermataLetturaManualeUnix =
+    adesso.unixtime() + DURATA_DISPLAY_LETTURA_MANUALE_SEC;
+
+  ultimoMinutoManualeMostrato = 255;
+  ultimaOraManualeMostrata = 255;
+  ultimoGiornoManualeMostrato = 0;
+
+  mostraLetturaManualeLCD(adesso);
+
+}
+
+void gestisciSchermataLetturaManuale(DateTime adesso) {
+  uint32_t oraUnix = adesso.unixtime();
+
+  if (oraUnix >= fineSchermataLetturaManualeUnix) {
+    schermataLetturaManualeAttiva = false;
+
+    ultimoMinutoMostrato = 255;
+
+    return;
+  }
+
+  if (
+    adesso.minute() != ultimoMinutoManualeMostrato ||
+    adesso.hour() != ultimaOraManualeMostrata ||
+    adesso.day() != ultimoGiornoManualeMostrato
+  ) {
+    mostraLetturaManualeLCD(adesso);
+
+    ultimoMinutoManualeMostrato = adesso.minute();
+    ultimaOraManualeMostrata = adesso.hour();
+    ultimoGiornoManualeMostrato = adesso.day();
+  }
+}
+
+void mostraLetturaManualeLCD(DateTime adesso) {
+  if (!displayAcceso) {
+    accendiDisplay();
+  }
+
+  lcd.clear();
+
+  lcd.setCursor(0, 0);
+  lcd.print("Manuale ");
+  stampaDueCifreLCD(adesso.hour());
+  lcd.print(":");
+  stampaDueCifreLCD(adesso.minute());
+
+  uint32_t oraUnix = adesso.unixtime();
+
+  uint32_t minutiResidui = 0;
+  if (fineSchermataLetturaManualeUnix > oraUnix) {
+    minutiResidui = (fineSchermataLetturaManualeUnix - oraUnix + 59) / 60;
+  }
+
+  lcd.print(" R:");
+  lcd.print(minutiResidui);
+  lcd.print("m");
+
+  lcd.setCursor(0, 1);
+  lcd.print("S1:");
+  stampaPercentualeLCD(percentualiUmidita[0]);
+  lcd.print(" S2:");
+  stampaPercentualeLCD(percentualiUmidita[1]);
+
+  lcd.setCursor(0, 2);
+  lcd.print("S3:");
+  stampaPercentualeLCD(percentualiUmidita[2]);
+  lcd.print(" S4:");
+  stampaPercentualeLCD(percentualiUmidita[3]);
+
+  lcd.setCursor(0, 3);
+
+  if (esisteSensoreSottoSoglia()) {
+    lcd.print("STATO: SECCO       ");
+  } else {
+    lcd.print("STATO: OK          ");
+  }
+}
 
 void registraLetturaEseguita(DateTime adesso) {
   ultimoAnnoLettura = adesso.year();
@@ -710,7 +886,7 @@ void avviaMonitoraggio(DateTime adesso) {
 
   accendiDisplay();
 
-  if (!visualizzazioneManualeAttiva) {
+  if (!visualizzazioneManualeAttiva && !schermataLetturaManualeAttiva) {
     mostraMonitoraggioLCD(adesso);
   }
 }
@@ -747,6 +923,7 @@ void gestisciMonitoraggio(DateTime adesso) {
   // Ridisegna la schermata di monitoraggio solo quando cambia il minuto.
   if (
     !visualizzazioneManualeAttiva &&
+    !schermataLetturaManualeAttiva &&
     (
       adesso.minute() != ultimoMinutoMonitorMostrato ||
       adesso.hour() != ultimaOraMonitorMostrata ||
@@ -925,7 +1102,7 @@ void avviaPostSpegnimento(DateTime adesso) {
 
   accendiDisplay();
 
-  if (!visualizzazioneManualeAttiva) {
+  if (!visualizzazioneManualeAttiva && !schermataLetturaManualeAttiva) {
     mostraPostSpegnimentoLCD(adesso);
   }
 }
@@ -1042,6 +1219,9 @@ void isrPulsanteProssimaEsecuzione() {
 
 
 void gestisciPulsanteProssimaEsecuzione(DateTime adesso) {
+  if (schermataLetturaManualeAttiva) {
+    return;
+  }
   bool pulsantePremuto = false;
 
   // Legge e azzera in modo sicuro il flag impostato dall'interrupt.
@@ -1079,9 +1259,9 @@ void avviaVisualizzazioneManuale(DateTime adesso) {
   visualizzazioneManualeAttiva = true;
   fineVisualizzazioneManualeUnix = adesso.unixtime() + DURATA_VISUALIZZAZIONE_MANUALE_SEC;
 
-  ultimoMinutoManualeMostrato = 255;
-  ultimaOraManualeMostrata = 255;
-  ultimoGiornoManualeMostrato = 0;
+  ultimoMinutoProssimaMostrato = 255;
+  ultimaOraProssimaMostrata = 255;
+  ultimoGiornoProssimaMostrato = 0;
 
   accendiDisplay();
   mostraProssimaEsecuzioneLCD(adesso);
@@ -1113,15 +1293,15 @@ void gestisciVisualizzazioneManuale(DateTime adesso) {
   }
 
   if (
-    adesso.minute() != ultimoMinutoManualeMostrato ||
-    adesso.hour() != ultimaOraManualeMostrata ||
-    adesso.day() != ultimoGiornoManualeMostrato
+    adesso.minute() != ultimoMinutoProssimaMostrato ||
+    adesso.hour() != ultimaOraProssimaMostrata ||
+    adesso.day() != ultimoGiornoProssimaMostrato
   ) {
     mostraProssimaEsecuzioneLCD(adesso);
 
-    ultimoMinutoManualeMostrato = adesso.minute();
-    ultimaOraManualeMostrata = adesso.hour();
-    ultimoGiornoManualeMostrato = adesso.day();
+    ultimoMinutoProssimaMostrato = adesso.minute();
+    ultimaOraProssimaMostrata = adesso.hour();
+    ultimoGiornoProssimaMostrato = adesso.day();
   }
 }
 
@@ -1154,26 +1334,29 @@ void mostraProssimaEsecuzioneLCD(DateTime adesso) {
   lcd.print("Prossima esecuzione");
 
   lcd.setCursor(0, 1);
+
   if (eventoMonitoraggio) {
-    lcd.print("Rilettura sensori");
+    lcd.print("Rilettura sensori ");
   } else {
-    uint16_t minutoProssima;
+    uint16_t albaEvento = 0;
+    uint16_t tramontoEvento = 0;
 
-    if (monitoraggioAttivo) {
-      DateTime prossimaEsecuzione(prossimaLetturaMonitoraggioUnix);
-      minutoProssima = prossimaEsecuzione.hour() * 60 + prossimaEsecuzione.minute();
+    calcolaAlbaTramontoTorino(
+      evento.year(),
+      evento.month(),
+      evento.day(),
+      albaEvento,
+      tramontoEvento
+    );
 
-      lcd.print("Rilettura sensori");
+    uint16_t minutoEvento = evento.hour() * 60 + evento.minute();
+
+    if (minutoEvento == albaEvento) {
+      lcd.print("Lettura alba      ");
+    } else if (minutoEvento == tramontoEvento) {
+      lcd.print("Lettura tramonto  ");
     } else {
-      minutoProssima = prossimoMinutoLettura(adesso);
-
-      if (minutoProssima == minutoLetturaMattina) {
-        lcd.print("Lettura alba     ");
-      } else if (minutoProssima == minutoLetturaSera) {
-        lcd.print("Lettura tramonto ");
-      } else {
-        lcd.print("Lettura sensori  ");
-      }
+      lcd.print("Lettura sensori   ");
     }
   }
 
